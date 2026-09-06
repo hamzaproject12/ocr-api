@@ -1,83 +1,173 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import pytesseract
-from PIL import Image
 import io
-import re
+import logging
+import os
+from datetime import date
+
+import pypdfium2 as pdfium
+import pytesseract
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image, ImageOps
+
+import mrz
+
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_PAGES = 10
+PDF_RENDER_DPI = 300
+# The machine-readable zone is printed in OCR-B: a single block of uppercase
+# text, so a whitelist and a block layout give Tesseract far less room to guess.
+MRZ_OCR_CONFIG = "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
+
+logger = logging.getLogger("passport-ocr")
 
 app = FastAPI(title="Passport OCR API")
 
+# "*" with credentials is rejected by browsers, so credentials are only enabled
+# when ALLOWED_ORIGINS names the sites explicitly.
+origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
+    allow_origins=origins,
+    allow_credentials=origins != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+EMPTY_FIELDS = {
+    "first_name": "",
+    "last_name": "",
+    "passport": "",
+    "nationality": "",
+    "date_of_birth": "",
+    "sex": "",
+    "date_of_expiry": "",
+    "personal_id_number": "",
+}
+
+
+def _prepare(image: Image.Image) -> Image.Image:
+    """Straighten and upscale an image so the MRZ is large enough to read."""
+    image = ImageOps.exif_transpose(image).convert("L")
+    if image.width < 1600:
+        ratio = 1600 / image.width
+        image = image.resize((1600, max(1, round(image.height * ratio))), Image.LANCZOS)
+    return image
+
+
+def _ocr(image: Image.Image) -> dict | None:
+    prepared = _prepare(image)
+    result = mrz.parse(pytesseract.image_to_string(prepared))
+    if result is None:
+        # Second pass, tuned for the machine-readable zone alone.
+        result = mrz.parse(pytesseract.image_to_string(prepared, config=MRZ_OCR_CONFIG))
+    return result
+
+
+def _pdf_pages(document: "pdfium.PdfDocument"):
+    """Yield (page number, embedded text, renderer) for each page of a PDF."""
+    try:
+        for index in range(min(len(document), MAX_PAGES)):
+            page = document[index]
+            text_page = page.get_textpage()
+            try:
+                embedded = text_page.get_text_range()
+            finally:
+                text_page.close()
+            # Rendering is deferred: a PDF generated digitally already carries
+            # the MRZ as text, and never needs to be rasterised and OCR'd.
+            yield index + 1, embedded, lambda p=page: p.render(
+                scale=PDF_RENDER_DPI / 72
+            ).to_pil()
+    finally:
+        document.close()
+
+
+def _pages(data: bytes, filename: str):
+    """Return the pages of the upload as (page number, embedded text, renderer)."""
+    if data[:5] == b"%PDF-":
+        try:
+            return _pdf_pages(pdfium.PdfDocument(data))
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Could not read the PDF '{filename}'.")
+    try:
+        image = Image.open(io.BytesIO(data))
+        image.load()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file '{filename}': expected an image or a PDF.",
+        )
+    return [(1, None, lambda: image)]
+
+
+@app.get("/health")
+def health():
+    try:
+        version = str(pytesseract.get_tesseract_version())
+    except Exception as error:
+        return {"status": "degraded", "tesseract": None, "detail": str(error)}
+    return {"status": "ok", "tesseract": version}
+
+
 @app.post("/extract-text/")
 async def extract_text(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image.")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
 
     try:
-        image_bytes = await file.read()
-        image = Image.open(io.BytesIO(image_bytes))
-        
-        # 1. Extract raw text from the image
-        raw_text = pytesseract.image_to_string(image)
-        
-        # 2. Define the exact JSON structure you want to return
-        extracted_data = {
-            "first_name": "",
-            "last_name": "",
-            "passport": "",
-            "nationality": "",
-            "date_of_birth": "",
-            "sex": "",
-            "date_of_expiry": "",
-            "personal_id_number": ""
-        }
-        
-        # 3. Aggressive Cleaning: Remove all spaces and replace common OCR error 'K' with '<'
-        cleaned_lines = [line.replace(' ', '').replace('K', '<') for line in raw_text.split('\n')]
-        
-        line1 = ""
-        line2 = ""
-        
-        # 4. Hunt for the MRZ lines anywhere in the document
-        for line in cleaned_lines:
-            # Line 1 always starts with P<
-            if line.startswith('P<'):
-                line1 = line
-            # Line 2 usually starts with 9 alphanumeric characters followed by a digit and a 3-letter country code
-            elif re.search(r'^[A-Z0-9]{9}[0-9][A-Z<]{3}', line):
-                line2 = line
+        result, page_number = None, None
+        for number, embedded, render in _pages(data, file.filename):
+            result = mrz.parse(embedded) if embedded else None
+            if result is None:
+                result = _ocr(render())
+            if result is not None:
+                page_number = number
+                break
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("OCR failed for %s", file.filename)
+        raise HTTPException(status_code=500, detail=f"An error occurred: {error}")
 
-        # 5. Map the data to your JSON if the lines were found
-        if line1:
-            # P<MARLASTNAME<<FIRSTNAME<<<<<
-            names_part = line1[5:].split('<<')
-            if len(names_part) > 0:
-                extracted_data["last_name"] = names_part[0].replace('<', '')
-            if len(names_part) > 1:
-                extracted_data["first_name"] = names_part[1].replace('<', '')
+    return _response(file.filename, result, page_number)
 
-        if line2 and len(line2) >= 28:
-            extracted_data["passport"] = line2[0:9].replace('<', '')
-            extracted_data["nationality"] = line2[10:13].replace('<', '')
-            extracted_data["date_of_birth"] = line2[13:19]
-            extracted_data["sex"] = line2[20]
-            extracted_data["date_of_expiry"] = line2[21:27]
-            # Usually the Moroccan CNIE is in this section
-            extracted_data["personal_id_number"] = line2[28:42].replace('<', '')
 
-        # 6. Always return the formatted JSON
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "data": extracted_data
-        }
+def _response(filename: str | None, result: dict | None, page_number: int | None) -> dict:
+    """Build the reply, keeping the original `data` keys the front end reads."""
+    payload = {
+        "status": "success",
+        "filename": filename,
+        "data": dict(EMPTY_FIELDS),
+        "mrz_found": result is not None,
+        "document_format": None,
+        "page": page_number,
+        "checks": {},
+        "valid": False,
+        "expired": None,
+        "mrz": [],
+    }
+    if result is None:
+        return payload
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+    fields = result["fields"]
+    birth_iso = mrz.to_iso(fields["date_of_birth"], past=True)
+    expiry_iso = mrz.to_iso(fields["date_of_expiry"], past=False)
+
+    payload["data"] = {
+        **fields,
+        # Added alongside the raw YYMMDD values, which keep their original format.
+        "date_of_birth_iso": birth_iso,
+        "date_of_expiry_iso": expiry_iso,
+    }
+    payload["document_format"] = result["document_format"]
+    payload["checks"] = result["checks"]
+    payload["valid"] = all(result["checks"].values())
+    payload["expired"] = expiry_iso < date.today().isoformat() if expiry_iso else None
+    payload["mrz"] = result["mrz"]
+    return payload
