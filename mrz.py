@@ -104,9 +104,15 @@ def _sex(char: str) -> str:
 
 def _split_names(field: str) -> tuple[str, str]:
     """Split an MRZ name field into (surname, given names)."""
-    # Drop the padding first: a long run of K's at the end is filler, while a
-    # single trailing K is a letter (MALIK).
-    field = re.sub(r"K{3,}$", "", field.rstrip("<")).rstrip("<")
+    # Drop the padding first. Tesseract renders the trailing run of chevrons as
+    # whatever letter it takes them for - K, S, C - so strip any run of three or
+    # more identical characters at the end, repeatedly, since the run and the
+    # chevrons it failed to read are usually interleaved. A single trailing
+    # letter is part of the name (MALIK).
+    previous = None
+    while previous != field:
+        previous = field
+        field = re.sub(r"(.)\1{2,}$", "", field.rstrip("<"))
     # Only then guess at KK-as-separator, and only if no real one survived.
     if "<<" not in field and re.search(r"K{2,}", field):
         field = re.sub(r"K{2,}", lambda m: "<" * len(m.group()), field)
