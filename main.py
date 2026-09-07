@@ -54,13 +54,37 @@ def _prepare(image: Image.Image) -> Image.Image:
     return image
 
 
-def _ocr(image: Image.Image) -> dict | None:
-    prepared = _prepare(image)
-    result = mrz.parse(pytesseract.image_to_string(prepared))
+def _score(result: dict | None) -> int:
     if result is None:
-        # Second pass, tuned for the machine-readable zone alone.
-        result = mrz.parse(pytesseract.image_to_string(prepared, config=MRZ_OCR_CONFIG))
+        return -1
+    return sum(1 for ok in result["checks"].values() if ok)
+
+
+def _read_orientation(image: Image.Image) -> dict | None:
+    """OCR one orientation with default then MRZ-tuned settings; return the better read."""
+    result = mrz.parse(pytesseract.image_to_string(image))
+    if result is None or not all(result["checks"].values()):
+        second = mrz.parse(pytesseract.image_to_string(image, config=MRZ_OCR_CONFIG))
+        if _score(second) > _score(result):
+            result = second
     return result
+
+
+def _ocr(image: Image.Image) -> dict | None:
+    """OCR the image; try 90/180/270-degree rotations when the first read is unverified."""
+    prepared = _prepare(image)
+    best = _read_orientation(prepared)
+    # Scanned or rotated PDF pages often place the MRZ vertically. Only rotate if
+    # what we have is missing checks - a fully-verified read is trusted as-is.
+    if best is not None and all(best["checks"].values()):
+        return best
+    for angle in (270, 90, 180):
+        candidate = _read_orientation(prepared.rotate(angle, expand=True))
+        if _score(candidate) > _score(best):
+            best = candidate
+            if all(best["checks"].values()):
+                break
+    return best
 
 
 def _pdf_pages(document: "pdfium.PdfDocument"):
