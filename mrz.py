@@ -36,9 +36,13 @@ _TO_ALPHA = str.maketrans("012358", "OIZBSB")
 # carries.
 _CONFUSIONS = {"0": "O", "O": "0", "1": "I", "I": "1", "5": "S", "S": "5",
                "8": "B", "B": "8", "2": "Z", "Z": "2", "6": "G", "G": "6"}
-# Repairing more than two glyphs stops being a correction: at that point enough
-# readings satisfy the check digit that a match means nothing.
-_MAX_SWAPS = 2
+# Repairing more than one glyph stops being a correction. A nine-character field
+# offers about nine single-character repairs and fifty double ones, and a check
+# digit only has ten values: past the first round, something matches by luck.
+# That is how a barely legible photograph produced 'NIS1PZ964' with its check
+# digit apparently confirmed. One round costs nothing real - no document in the
+# sample set needs two - and stops the parser inventing a number it can vouch for.
+_MAX_SWAPS = 1
 # Nearly every issuer writes a document number as letters then digits, which
 # settles the ties the check digit cannot - both 'ZO8062424' and 'Z08062A24'
 # check out, and only the first has that shape.

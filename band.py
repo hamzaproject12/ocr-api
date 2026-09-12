@@ -36,8 +36,11 @@ MIN_CHAR_FRACTION = 0.004
 MAX_CHAR_FRACTION = 0.060
 # Height at which Tesseract reads OCR-B most reliably.
 TARGET_CHAR_HEIGHT = 40
-# Rows this far apart, measured in glyph heights, belong to the same zone.
-MAX_ROW_GAP = 2.5
+# Rows this far apart, measured in glyph heights, belong to the same zone. The
+# line pitch of an MRZ is a little over two glyph heights, but the height being
+# measured is a median over a line that is mostly chevrons - shorter than the
+# letters - so the allowance has to sit well above the nominal spacing.
+MAX_ROW_GAP = 3.2
 MAX_BANDS = 4
 # How far off square a page may be laid on the scanner and still have its rows
 # grouped correctly, and how finely that range is searched. Half a degree is
@@ -168,9 +171,34 @@ def _rows(boxes: list[tuple], angle: float = 0.0) -> list[list[tuple]]:
     return rows
 
 
+def _glyph_centres(row: list[tuple]) -> np.ndarray:
+    """The row's glyph centres, with fragments of one glyph fused back together.
+
+    A worn or low-resolution scan breaks characters into pieces - the bowl of a
+    B away from its stem, a chevron into two strokes - and each piece arrives
+    here as its own component. Two centres closer than half a pitch cannot be
+    two glyphs of a monospaced line, so they are one, and fusing them is what
+    lets a photographed passport still measure as regular.
+    """
+    centres = np.sort(np.array([box[4] for box in row], dtype=float))
+    gaps = np.diff(centres)
+    if len(gaps) == 0:
+        return centres
+    pitch = float(np.median(gaps))
+    if pitch <= 0:
+        return centres
+    fused = [centres[0]]
+    for centre in centres[1:]:
+        if centre - fused[-1] < 0.5 * pitch:
+            fused[-1] = (fused[-1] + centre) / 2
+        else:
+            fused.append(centre)
+    return np.array(fused)
+
+
 def _agreement(row: list[tuple]) -> float:
     """Share of the row's glyph gaps that match its own pitch."""
-    gaps = np.diff(np.sort(np.array([box[4] for box in row])))
+    gaps = np.diff(_glyph_centres(row))
     if len(gaps) == 0:
         return 0.0
     pitch = float(np.median(gaps))
