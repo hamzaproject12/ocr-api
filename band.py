@@ -39,6 +39,11 @@ TARGET_CHAR_HEIGHT = 40
 # Rows this far apart, measured in glyph heights, belong to the same zone.
 MAX_ROW_GAP = 2.5
 MAX_BANDS = 4
+# How far off square a page may be laid on the scanner and still have its rows
+# grouped correctly, and how finely that range is searched. Half a degree is
+# already under a glyph's height of drift across a full MRZ line.
+MAX_SKEW = 5.0
+SKEW_STEP = 0.25
 # Glyphs are measured on a copy reduced to this short side. Detection is then
 # insensitive to the resolution it is handed: a 600 dpi scan and a phone photo
 # arrive at the thresholder with glyphs the same size, and the window below
@@ -101,11 +106,52 @@ def _char_boxes(gray: np.ndarray) -> list[tuple]:
     return boxes
 
 
-def _rows(boxes: list[tuple]) -> list[list[tuple]]:
-    """Group glyphs into rows by their vertical centre."""
-    boxes = sorted(boxes, key=lambda box: box[5])
+def skew(boxes: list[tuple]) -> float:
+    """The angle, in degrees, at which the page's glyphs stack into sharpest rows.
+
+    A sheet laid down by hand on a flatbed lands a degree or two off square, and
+    over the width of an MRZ line that is more vertical drift than a row is
+    allowed to have - the line breaks into pieces, each too short to be taken for
+    a machine-readable zone. Rather than accept a looser row, which would let
+    ordinary text chain together, find the tilt first.
+
+    Projecting every glyph's centre onto a rotated vertical axis and squaring the
+    resulting histogram is the standard measure: it peaks when the projection
+    concentrates in a few tight bands, which is exactly when the angle is right.
+    """
+    if len(boxes) < MIN_CHARS:
+        return 0.0
+    xs = np.array([box[4] for box in boxes], dtype=float)
+    ys = np.array([box[5] for box in boxes], dtype=float)
+    xs -= xs.mean()
+    ys -= ys.mean()
+    bins = max(20, round((ys.max() - ys.min()) / max(np.median([b[3] for b in boxes]) / 3, 1)))
+    best_angle, best_score = 0.0, -1.0
+    for angle in np.arange(-MAX_SKEW, MAX_SKEW + 1e-9, SKEW_STEP):
+        radians = np.radians(angle)
+        profile, _ = np.histogram(xs * np.sin(radians) + ys * np.cos(radians), bins=bins)
+        score = float(np.square(profile.astype(float)).sum())
+        if score > best_score:
+            best_score, best_angle = score, float(angle)
+    return best_angle
+
+
+def _rows(boxes: list[tuple], angle: float = 0.0) -> list[list[tuple]]:
+    """Group glyphs into rows by their vertical centre, along the page's own tilt.
+
+    Boxes keep their true coordinates throughout; only the value they are sorted
+    and cut on is measured along the tilted axis, so the crop and the deskew
+    further down still work from where the glyphs actually are.
+    """
     if not boxes:
         return []
+    radians = np.radians(angle)
+    sin_a, cos_a = np.sin(radians), np.cos(radians)
+
+    def level(box: tuple) -> float:
+        return box[4] * sin_a + box[5] * cos_a
+
+    boxes = sorted(boxes, key=level)
     rows, current = [], [boxes[0]]
     # Measured against the row's first glyph rather than its last, so a page of
     # text that steps gently down cannot chain itself into one enormous row, and
@@ -113,7 +159,7 @@ def _rows(boxes: list[tuple]) -> list[list[tuple]]:
     # own line.
     for box in boxes[1:]:
         tolerance = 0.6 * max(float(np.median([b[3] for b in current])), box[3])
-        if box[5] - current[0][5] <= tolerance:
+        if level(box) - level(current[0]) <= tolerance:
             current.append(box)
         else:
             rows.append(current)
@@ -147,11 +193,17 @@ def _extent(row: list[tuple]) -> tuple[int, int, int, int]:
     )
 
 
+def _centre(row: list[tuple]) -> float:
+    """The row's vertical centre. Taken as a median rather than from whichever
+    glyph happens to sort first, which on a tilted line is an edge, not a centre."""
+    return float(np.median([box[5] for box in row]))
+
+
 def _adjacent(first: list[tuple], second: list[tuple]) -> bool:
     """True when two rows sit one under the other and share a left and right edge,
     the way the lines of one machine-readable zone do."""
     height = float(np.median([box[3] for box in first]))
-    if abs(second[0][5] - first[0][5]) > MAX_ROW_GAP * height:
+    if abs(_centre(second) - _centre(first)) > MAX_ROW_GAP * height:
         return False
     left, _, right, _ = _extent(first)
     other_left, _, other_right, _ = _extent(second)
@@ -168,7 +220,7 @@ def _group(rows: list[list[tuple]]) -> list[list[list[tuple]]]:
     mark is likeliest to spoil the measurement - and the line above has already
     established that this is the machine-readable zone.
     """
-    rows = sorted(rows, key=lambda row: row[0][5])
+    rows = sorted(rows, key=_centre)
     zones: list[list[int]] = []
     for index, row in enumerate(rows):
         if not _is_regular(row):
@@ -282,7 +334,8 @@ def candidates(image: Image.Image):
             else cv2.resize(gray, (round(gray.shape[1] / factor), round(gray.shape[0] / factor)),
                             interpolation=cv2.INTER_AREA)
         )
-        for zone in _group(_rows(_char_boxes(reduced))):
+        boxes = _char_boxes(reduced)
+        for zone in _group(_rows(boxes, skew(boxes))):
             found.append((_score(zone), gray, zone, factor))
     found.sort(key=lambda item: item[0], reverse=True)
 

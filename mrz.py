@@ -44,6 +44,10 @@ _MAX_SWAPS = 2
 # check out, and only the first has that shape.
 _NUMBER_SHAPE = re.compile(r"[A-Z]*[0-9]*<*")
 
+# How much of a line has to have been read for the rest to be taken as filler
+# Tesseract gave up on. Below this the line is a fragment, not a short reading.
+MIN_LINE_SHARE = 0.6
+
 _WEIGHTS = (7, 3, 1)
 
 # (line length, number of lines, format), in the order we try them.
@@ -295,7 +299,17 @@ def _candidate_groups(text: str):
     for size, count, fmt in _LAYOUTS:
         for start in range(len(lines) - count + 1):
             group = lines[start:start + count]
-            if any(abs(len(line) - size) > 2 for line in group):
+            # A line may come back short and still be usable. The name line ends
+            # in a long run of chevrons - the faintest ink on the page - and
+            # Tesseract regularly stops before the end of it, while the line
+            # below, which ends in digits and carries every check digit, reads
+            # in full. Requiring both lines to be full length threw that away.
+            # What is missing is filler, and _fit puts the filler back.
+            if any(not size * MIN_LINE_SHARE <= len(line) <= size + 2 for line in group):
+                continue
+            # One line must still be full length, or every layout would match
+            # every zone: a 44-character line reads as a short 36-character one.
+            if not any(abs(len(line) - size) <= 2 for line in group):
                 continue
             # The first character is the document code: P for passports,
             # I/A/C for identity cards and other travel documents.
