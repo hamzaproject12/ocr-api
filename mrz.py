@@ -15,6 +15,7 @@ which also destroyed the legitimate K's in names and document numbers.
 
 from __future__ import annotations
 
+import itertools
 import re
 from datetime import date
 
@@ -27,6 +28,21 @@ _LOOKALIKES = {"«": "<<", "»": "<<", "‹": "<", "›": "<",
 # Look-alike fixes applied inside a field whose content type is known.
 _TO_DIGIT = str.maketrans("OQDIL|ZSBGT", "00011125867")
 _TO_ALPHA = str.maketrans("012358", "OIZBSB")
+
+# Document and personal numbers are the only fields that mix letters and digits,
+# so neither translation above can be applied wholesale - 'ZO8062424' and
+# 'Z08062424' are both well-formed readings. Each look-alike is swapped
+# individually and the check digit says which reading the passport actually
+# carries.
+_CONFUSIONS = {"0": "O", "O": "0", "1": "I", "I": "1", "5": "S", "S": "5",
+               "8": "B", "B": "8", "2": "Z", "Z": "2", "6": "G", "G": "6"}
+# Repairing more than two glyphs stops being a correction: at that point enough
+# readings satisfy the check digit that a match means nothing.
+_MAX_SWAPS = 2
+# Nearly every issuer writes a document number as letters then digits, which
+# settles the ties the check digit cannot - both 'ZO8062424' and 'Z08062A24'
+# check out, and only the first has that shape.
+_NUMBER_SHAPE = re.compile(r"[A-Z]*[0-9]*<*")
 
 _WEIGHTS = (7, 3, 1)
 
@@ -55,6 +71,27 @@ def check_digit(field: str) -> str | None:
     return str(total % 10)
 
 
+def _swapped(bases: list[str]) -> list[str]:
+    """Readings of an alphanumeric field with look-alike glyphs swapped.
+
+    Ordered by how much they claim the OCR got wrong: untouched readings first,
+    then one repaired glyph, then two, and within each round the readings shaped
+    like a document number ahead of the rest.
+    """
+    readings: list[str] = []
+    for count in range(1, _MAX_SWAPS + 1):
+        round_: list[str] = []
+        for base in bases:
+            places = [i for i, char in enumerate(base) if char in _CONFUSIONS]
+            for combination in itertools.combinations(places, count):
+                chars = list(base)
+                for index in combination:
+                    chars[index] = _CONFUSIONS[chars[index]]
+                round_.append("".join(chars))
+        readings.extend(sorted(round_, key=lambda r: not _NUMBER_SHAPE.fullmatch(r)))
+    return readings
+
+
 def _variants(field: str, kind: str) -> list[str]:
     """Plausible readings of a field, most conservative first."""
     readings: list[str] = []
@@ -73,6 +110,9 @@ def _variants(field: str, kind: str) -> list[str]:
     # A run of two or more K's is a filler sequence, never part of a real value.
     add(re.sub(r"K{2,}", lambda m: "<" * len(m.group()), field))
     add(field.replace("K", "<"))
+    if kind == "doc":
+        for candidate in _swapped(list(readings)):
+            add(candidate)
     return readings
 
 
@@ -118,8 +158,14 @@ def _split_names(field: str) -> tuple[str, str]:
         field = re.sub(r"K{2,}", lambda m: "<" * len(m.group()), field)
 
     surname, _, given = field.partition("<<")
+    # Inside the name field a single '<' separates names and a run of two or more
+    # ends them, so anything past the next run is padding - and any letters
+    # Tesseract read there are its failed attempts at the chevrons.
+    given = re.split(r"<{2,}", given)[0]
 
     def tidy(part: str) -> str:
+        # Digits are not legal in a name field: whatever produced them is noise.
+        part = re.sub(r"[^A-Z<]", "", part)
         return re.sub(r"\s+", " ", part.replace("<", " ")).strip()
 
     return tidy(surname), tidy(given)
@@ -159,11 +205,11 @@ def _result(fmt, lines, *, surname, given, number, nationality, birth, sex, expi
 def _parse_td3(lines: list[str]) -> dict:
     line1, line2 = lines
     surname, given = _split_names(line1[5:])
-    number, number_ok = _read(line2, 0, 9, 9)
+    number, number_ok = _read(line2, 0, 9, 9, "doc")
     nationality, _ = _read(line2, 10, 13, kind="alpha")
     birth, birth_ok = _read(line2, 13, 19, 19, "num")
     expiry, expiry_ok = _read(line2, 21, 27, 27, "num")
-    personal, personal_ok = _read(line2, 28, 42, 42)
+    personal, personal_ok = _read(line2, 28, 42, 42, "doc")
     return _result(
         "TD3", lines,
         surname=surname, given=given, number=number, nationality=nationality,
@@ -176,7 +222,7 @@ def _parse_td3(lines: list[str]) -> dict:
 def _parse_td2(lines: list[str]) -> dict:
     line1, line2 = lines
     surname, given = _split_names(line1[5:])
-    number, number_ok = _read(line2, 0, 9, 9)
+    number, number_ok = _read(line2, 0, 9, 9, "doc")
     nationality, _ = _read(line2, 10, 13, kind="alpha")
     birth, birth_ok = _read(line2, 13, 19, 19, "num")
     expiry, expiry_ok = _read(line2, 21, 27, 27, "num")
@@ -190,7 +236,7 @@ def _parse_td2(lines: list[str]) -> dict:
 
 def _parse_td1(lines: list[str]) -> dict:
     line1, line2, line3 = lines
-    number, number_ok = _read(line1, 5, 14, 14)
+    number, number_ok = _read(line1, 5, 14, 14, "doc")
     birth, birth_ok = _read(line2, 0, 6, 6, "num")
     expiry, expiry_ok = _read(line2, 8, 14, 14, "num")
     nationality, _ = _read(line2, 15, 18, kind="alpha")

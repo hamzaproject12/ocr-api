@@ -9,6 +9,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
 
+import band
 import mrz
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -17,6 +18,11 @@ PDF_RENDER_DPI = 300
 # The machine-readable zone is printed in OCR-B: a single block of uppercase
 # text, so a whitelist and a block layout give Tesseract far less room to guess.
 MRZ_OCR_CONFIG = "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
+# Check digits that must agree before a reading is called an MRZ. Every layout
+# protects at least three fields, and a page of background pattern happens to
+# satisfy one of them often enough to be worth guarding against: a read that
+# clears none of them used to be returned as a successful extraction.
+MIN_CHECKS = 2
 
 logger = logging.getLogger("passport-ocr")
 
@@ -60,31 +66,61 @@ def _score(result: dict | None) -> int:
     return sum(1 for ok in result["checks"].values() if ok)
 
 
+def _verified(result: dict | None) -> bool:
+    return result is not None and all(result["checks"].values())
+
+
 def _read_orientation(image: Image.Image) -> dict | None:
     """OCR one orientation with default then MRZ-tuned settings; return the better read."""
     result = mrz.parse(pytesseract.image_to_string(image))
-    if result is None or not all(result["checks"].values()):
+    if not _verified(result):
         second = mrz.parse(pytesseract.image_to_string(image, config=MRZ_OCR_CONFIG))
         if _score(second) > _score(result):
             result = second
     return result
 
 
+def _read_band(image: Image.Image) -> dict | None:
+    """OCR one located zone, stopping at the first fully verified reading.
+
+    The crop holds nothing but the MRZ, so the tuned settings always apply. What
+    differs between the attempts is how hard the background is pushed away: most
+    zones read straight off the flattened grey, a faded one needs the threshold,
+    and a few come out best untouched, since flattening a clean scan can thin the
+    strokes enough to lose them."""
+    result = None
+    for rendering in (band.flatten(image), band.binarise(image), image):
+        candidate = mrz.parse(pytesseract.image_to_string(rendering, config=MRZ_OCR_CONFIG))
+        if _score(candidate) > _score(result):
+            result = candidate
+            if _verified(result):
+                break
+    return result
+
+
 def _ocr(image: Image.Image) -> dict | None:
-    """OCR the image; try 90/180/270-degree rotations when the first read is unverified."""
+    """Locate the machine-readable zone, read it, and keep the best-verified result."""
     prepared = _prepare(image)
-    best = _read_orientation(prepared)
-    # Scanned or rotated PDF pages often place the MRZ vertically. Only rotate if
-    # what we have is missing checks - a fully-verified read is trusted as-is.
-    if best is not None and all(best["checks"].values()):
-        return best
-    for angle in (270, 90, 180):
-        candidate = _read_orientation(prepared.rotate(angle, expand=True))
+    best = None
+    located = False
+    for crop in band.candidates(prepared):
+        located = True
+        candidate = _read_band(crop)
         if _score(candidate) > _score(best):
             best = candidate
-            if all(best["checks"].values()):
-                break
-    return best
+            if _verified(best):
+                return best
+    # Nothing on the page was laid out like an MRZ - an image cropped so tightly
+    # that the zone runs to the edges, say. Fall back to reading the whole page.
+    if not located or _score(best) < MIN_CHECKS:
+        for angle in (0, 270, 90, 180):
+            page = prepared.rotate(angle, expand=True) if angle else prepared
+            candidate = _read_orientation(page)
+            if _score(candidate) > _score(best):
+                best = candidate
+                if _verified(best):
+                    break
+    return best if _score(best) >= MIN_CHECKS else None
 
 
 def _pdf_pages(document: "pdfium.PdfDocument"):
