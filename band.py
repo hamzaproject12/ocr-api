@@ -66,12 +66,18 @@ def _page_window(gray: np.ndarray) -> int:
 
 
 def _binary(gray: np.ndarray) -> np.ndarray:
-    """Ink mask of the page, flattened first and then thresholded adaptively,
-    because a scan lit unevenly has no single global threshold either."""
+    """Ink mask of the page. Adaptive, because a scan lit unevenly or printed
+    over a guilloche has no single global threshold.
+
+    Deliberately not flattened first. Dividing the page by its background finds
+    a few more zones on faded scans, but costs more than it wins: it thins the
+    strokes of an already clean scan until glyphs break into pieces the row
+    grouping can no longer see. Flattening earns its place on the crop, once the
+    zone is known and its scale with it.
+    """
     window = _page_window(gray)
     return cv2.adaptiveThreshold(
-        _flattened(gray, window), 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, window, 12,
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, window, 12
     )
 
 
